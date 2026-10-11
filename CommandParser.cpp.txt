@@ -1,0 +1,122 @@
+#include "CommandParser.hpp"
+#include "PWMOutputManager.hpp"
+#include "CANFrames.hpp"
+
+namespace
+{
+    constexpr uint32_t MAX_PWM_FREQUENCY_HZ = 100000U;
+    constexpr uint16_t MAX_PWM_DUTY = 10000U;
+}
+
+uint16_t CommandParser::ReadU16(
+    const uint8_t* data,
+    uint8_t offset)
+{
+    return static_cast<uint16_t>(
+        static_cast<uint16_t>(data[offset]) |
+        (static_cast<uint16_t>(data[offset + 1U]) << 8U)
+    );
+}
+
+uint32_t CommandParser::ReadU32(
+    const uint8_t* data,
+    uint8_t offset)
+{
+    return
+        static_cast<uint32_t>(data[offset]) |
+        (static_cast<uint32_t>(data[offset + 1U]) << 8U) |
+        (static_cast<uint32_t>(data[offset + 2U]) << 16U) |
+        (static_cast<uint32_t>(data[offset + 3U]) << 24U);
+}
+
+CommandParser::Result CommandParser::ProcessFrame(
+    const FDCANMessage& message)
+{
+    // This parser accepts standard CAN identifiers only.
+    if (message.extended)
+    {
+        return Result::INVALID_FORMAT;
+    }
+
+    switch (message.id)
+    {
+        case CANFrames::PWM_OUTPUT_CMD:
+            return HandlePWMOutputCommand(message);
+
+        default:
+            return Result::UNKNOWN_ID;
+    }
+}
+
+CommandParser::Result CommandParser::HandlePWMOutputCommand(
+    const FDCANMessage& message)
+{
+    // Command payload must contain exactly 8 bytes.
+    if (message.length != 8U)
+    {
+        return Result::INVALID_FORMAT;
+    }
+
+    // Decode the payload.
+    const uint16_t channelNumber =
+        ReadU16(message.data, 0U);
+
+    const uint32_t frequencyHz =
+        ReadU32(message.data, 2U);
+
+    const uint16_t dutyRaw =
+        ReadU16(message.data, 6U);
+
+    // Validate channel: external numbering is 1 through 12.
+    if ((channelNumber < 1U) || (channelNumber > 12U))
+    {
+        return Result::INVALID_CHANNEL;
+    }
+
+    // Frequency 0 means stop this output.
+    if (frequencyHz == 0U)
+    {
+        if (!PWMOutputManager::Stop(
+                static_cast<PWMOutput>(channelNumber - 1U)))
+        {
+            return Result::HARDWARE_ERROR;
+        }
+
+        return Result::OK;
+    }
+
+    if (frequencyHz > MAX_PWM_FREQUENCY_HZ)
+    {
+        return Result::INVALID_FREQUENCY;
+    }
+
+    if (dutyRaw > MAX_PWM_DUTY)
+    {
+        return Result::INVALID_DUTY;
+    }
+
+    const PWMOutput output =
+        static_cast<PWMOutput>(channelNumber - 1U);
+
+    // Set the frequency first, then the duty cycle.
+    if (!PWMOutputManager::SetFrequency(output, frequencyHz))
+    {
+        return Result::HARDWARE_ERROR;
+    }
+
+    // dutyRaw: 0 to 10000 represents 0.00% to 100.00%.
+    const float dutyPercent =
+        static_cast<float>(dutyRaw) / 100.0f;
+
+    if (!PWMOutputManager::SetDuty(output, dutyPercent))
+    {
+        return Result::HARDWARE_ERROR;
+    }
+
+    if (!PWMOutputManager::Start(output))
+    {
+        return Result::HARDWARE_ERROR;
+    }
+
+    return Result::OK;
+}

@@ -1,0 +1,411 @@
+
+#include "PWMOutputManager.hpp"
+
+bool PWMOutputManager::running[12] = {false};
+float PWMOutputManager::dutyCycle[12] = {0.0f};
+
+
+// ==================================================
+// CHANNEL VALIDATION
+// ==================================================
+
+bool PWMOutputManager::IsValidChannel(uint8_t channel)
+{
+    return channel >= 1U && channel <= 12U;
+}
+
+
+// ==================================================
+// TIMER CLOCK
+// ==================================================
+
+uint32_t PWMOutputManager::GetTimerClock(
+    TIM_HandleTypeDef* timer)
+{
+    if (timer == nullptr)
+        return 0U;
+
+    RCC_ClkInitTypeDef clockConfig = {};
+    uint32_t flashLatency = 0U;
+
+    HAL_RCC_GetClockConfig(&clockConfig, &flashLatency);
+
+    uint32_t pclk;
+    uint32_t apbDivider;
+
+    if (timer->Instance == TIM1)
+    {
+        pclk = HAL_RCC_GetPCLK2Freq();
+        apbDivider = clockConfig.APB2CLKDivider;
+    }
+    else if (timer->Instance == TIM2 ||
+             timer->Instance == TIM4)
+    {
+        pclk = HAL_RCC_GetPCLK1Freq();
+        apbDivider = clockConfig.APB1CLKDivider;
+    }
+    else
+    {
+        return 0U;
+    }
+
+    // STM32G491 timer clock:
+    // APB divider /1: timer clock = PCLK
+    // APB divider >1: timer clock = 2 * PCLK
+    if (apbDivider != RCC_HCLK_DIV1)
+        pclk *= 2U;
+
+    return pclk;
+}
+
+
+// ==================================================
+// TIMER STATUS
+// ==================================================
+
+bool PWMOutputManager::IsTimerRunning(
+    TIM_HandleTypeDef* timer)
+{
+    if (timer == nullptr)
+        return false;
+
+    for (uint8_t i = 0U; i < 12U; i++)
+    {
+        if (pwmOutputMap[i].timer == timer && running[i])
+            return true;
+    }
+
+    return false;
+}
+
+
+// ==================================================
+// INITIALIZATION
+// ==================================================
+
+bool PWMOutputManager::Init()
+{
+    for (uint8_t i = 0U; i < 12U; i++)
+    {
+        const PWMOutputConfig& config = pwmOutputMap[i];
+
+        if (config.timer == nullptr)
+            return false;
+
+        running[i] = false;
+        dutyCycle[i] = 0.0f;
+
+        __HAL_TIM_SET_COMPARE(
+            config.timer,
+            config.channel,
+            0U
+        );
+    }
+
+    return true;
+}
+
+
+// ==================================================
+// DUTY CYCLE CONVERSION
+// ==================================================
+
+uint32_t PWMOutputManager::DutyToCompare(
+    const PWMOutputConfig& config,
+    float duty)
+{
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(config.timer);
+    uint64_t period = (uint64_t)arr + 1ULL;
+
+    if (duty <= 0.0f)
+        return 0U;
+
+    // PWM mode 1: ARR produces a near-100% duty cycle.
+    if (duty >= 100.0f)
+        return arr;
+
+    uint64_t compare = (uint64_t)(
+        (double)period * (double)duty / 100.0
+    );
+
+    if (compare > arr)
+        compare = arr;
+
+    return (uint32_t)compare;
+}
+
+
+// ==================================================
+// SET FREQUENCY
+// ==================================================
+
+bool PWMOutputManager::SetFrequency(
+    uint8_t channel,
+    uint32_t frequency)
+{
+    if (!IsValidChannel(channel) || frequency == 0U)
+        return false;
+
+    TIM_HandleTypeDef* timer =
+        pwmOutputMap[channel - 1U].timer;
+
+    if (timer == nullptr)
+        return false;
+
+    // Do not change the timer while any mapped output
+    // belonging to it is running.
+    if (IsTimerRunning(timer))
+        return false;
+
+    uint32_t timerClock = GetTimerClock(timer);
+
+    if (timerClock == 0U || frequency > timerClock)
+        return false;
+
+    // TIM2 is 32-bit; TIM1 and TIM4 are 16-bit.
+    uint64_t maxPeriodCounts =
+        (timer->Instance == TIM2)
+        ? 4294967296ULL
+        : 65536ULL;
+
+    uint64_t ticksNeeded =
+        ((uint64_t)timerClock + frequency / 2ULL)
+        / frequency;
+
+    uint64_t prescalerDiv =
+        (ticksNeeded + maxPeriodCounts - 1ULL)
+        / maxPeriodCounts;
+
+    if (prescalerDiv < 1ULL)
+        prescalerDiv = 1ULL;
+
+    if (prescalerDiv > 65536ULL)
+        return false;
+
+    uint64_t denominator =
+        (uint64_t)frequency * prescalerDiv;
+
+    uint64_t periodCounts =
+        ((uint64_t)timerClock + denominator / 2ULL)
+        / denominator;
+
+    if (periodCounts < 1ULL ||
+        periodCounts > maxPeriodCounts)
+    {
+        return false;
+    }
+
+    uint32_t prescaler = (uint32_t)(prescalerDiv - 1ULL);
+    uint32_t arr = (uint32_t)(periodCounts - 1ULL);
+
+    __HAL_TIM_SET_PRESCALER(timer, prescaler);
+    __HAL_TIM_SET_AUTORELOAD(timer, arr);
+
+    // Load the new prescaler and ARR while the timer is stopped.
+    __HAL_TIM_GENERATE_EVENT(timer, TIM_EVENTSOURCE_UPDATE);
+
+    // Preserve the requested duty cycles on all channels
+    // sharing this timer.
+    for (uint8_t i = 0U; i < 12U; i++)
+    {
+        if (pwmOutputMap[i].timer == timer)
+        {
+            __HAL_TIM_SET_COMPARE(
+                timer,
+                pwmOutputMap[i].channel,
+                DutyToCompare(pwmOutputMap[i], dutyCycle[i])
+            );
+        }
+    }
+
+    return true;
+}
+
+
+// ==================================================
+// GET FREQUENCY
+// ==================================================
+
+uint32_t PWMOutputManager::GetFrequency(uint8_t channel)
+{
+    if (!IsValidChannel(channel))
+        return 0U;
+
+    TIM_HandleTypeDef* timer =
+        pwmOutputMap[channel - 1U].timer;
+
+    if (timer == nullptr)
+        return 0U;
+
+    uint32_t timerClock = GetTimerClock(timer);
+
+    uint64_t prescaler =
+        (uint64_t)__HAL_TIM_GET_PRESCALER(timer) + 1ULL;
+
+    uint64_t period =
+        (uint64_t)__HAL_TIM_GET_AUTORELOAD(timer) + 1ULL;
+
+    uint64_t divisor = prescaler * period;
+
+    if (timerClock == 0U || divisor == 0ULL)
+        return 0U;
+
+    return (uint32_t)(
+        ((uint64_t)timerClock + divisor / 2ULL) / divisor
+    );
+}
+
+
+// ==================================================
+// SET DUTY CYCLE
+// ==================================================
+
+bool PWMOutputManager::SetDuty(
+    uint8_t channel,
+    float duty)
+{
+    if (!IsValidChannel(channel))
+        return false;
+
+    if (duty < 0.0f || duty > 100.0f)
+        return false;
+
+    uint8_t index = channel - 1U;
+    const PWMOutputConfig& config = pwmOutputMap[index];
+
+    if (config.timer == nullptr)
+        return false;
+
+    uint32_t compare = DutyToCompare(config, duty);
+
+    __HAL_TIM_SET_COMPARE(
+        config.timer,
+        config.channel,
+        compare
+    );
+
+    dutyCycle[index] = duty;
+
+    return true;
+}
+
+
+// ==================================================
+// GET DUTY CYCLE
+// ==================================================
+
+float PWMOutputManager::GetDuty(uint8_t channel)
+{
+    if (!IsValidChannel(channel))
+        return 0.0f;
+
+    return dutyCycle[channel - 1U];
+}
+
+
+// ==================================================
+// START PWM
+// ==================================================
+
+bool PWMOutputManager::Start(uint8_t channel)
+{
+    if (!IsValidChannel(channel))
+        return false;
+
+    uint8_t index = channel - 1U;
+
+    if (running[index])
+        return true;
+
+    const PWMOutputConfig& config = pwmOutputMap[index];
+
+    if (config.timer == nullptr)
+        return false;
+
+    if (HAL_TIM_PWM_Start(
+            config.timer,
+            config.channel) != HAL_OK)
+    {
+        return false;
+    }
+
+    running[index] = true;
+
+    return true;
+}
+
+
+// ==================================================
+// STOP PWM
+// ==================================================
+
+bool PWMOutputManager::Stop(uint8_t channel)
+{
+    if (!IsValidChannel(channel))
+        return false;
+
+    uint8_t index = channel - 1U;
+
+    if (!running[index])
+        return true;
+
+    const PWMOutputConfig& config = pwmOutputMap[index];
+
+    if (HAL_TIM_PWM_Stop(
+            config.timer,
+            config.channel) != HAL_OK)
+    {
+        return false;
+    }
+
+    running[index] = false;
+
+    return true;
+}
+
+
+// ==================================================
+// START ALL OUTPUTS
+// ==================================================
+
+bool PWMOutputManager::StartAll()
+{
+    for (uint8_t channel = 1U; channel <= 12U; channel++)
+    {
+        if (!Start(channel))
+            return false;
+    }
+
+    return true;
+}
+
+
+// ==================================================
+// STOP ALL OUTPUTS
+// ==================================================
+
+bool PWMOutputManager::StopAll()
+{
+    bool success = true;
+
+    for (uint8_t channel = 1U; channel <= 12U; channel++)
+    {
+        if (!Stop(channel))
+            success = false;
+    }
+
+    return success;
+}
+
+
+// ==================================================
+// RUNNING STATUS
+// ==================================================
+
+bool PWMOutputManager::IsRunning(uint8_t channel)
+{
+    if (!IsValidChannel(channel))
+        return false;
+
+    return running[channel - 1U];
+}

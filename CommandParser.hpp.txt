@@ -1,0 +1,32 @@
+#ifndef COMMAND_PARSER_HPP
+#define COMMAND_PARSER_HPP
+
+#include "FDCANManager.hpp"
+#include <stdint.h>
+
+class CommandParser
+{
+public:
+    enum class Result : uint8_t
+    {
+        OK = 0,
+        UNKNOWN_ID,
+        INVALID_FORMAT,
+        INVALID_CHANNEL,
+        INVALID_FREQUENCY,
+        INVALID_DUTY,
+        HARDWARE_ERROR
+    };
+
+    static Result ProcessFrame(const FDCANMessage& message);
+
+private:
+    static Result HandlePWMOutputCommand(
+        const FDCANMessage& message
+    );
+
+    static uint16_t ReadU16(const uint8_t* data, uint8_t offset);
+    static uint32_t ReadU32(const uint8_t* data, uint8_t offset);
+};
+
+#endif
