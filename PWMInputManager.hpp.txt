@@ -9,59 +9,50 @@
 class PWMInputManager
 {
 public:
-    static bool Init();
+    static void Init();
 
-    // Input channel numbers: 1 to 8
-    static bool Start(uint8_t channel);
-    static bool Stop(uint8_t channel);
+    static bool Start(PWMInput input);
+    static bool Stop(PWMInput input);
 
-    static bool StartAll();
-    static bool StopAll();
+    static void StartAll();
+    static void StopAll();
 
-    // Measured PWM values
-    static uint32_t GetFrequency(uint8_t channel);
-    static float GetDuty(uint8_t channel);
-    static uint32_t GetPeriodUs(uint8_t channel);
-    static uint32_t GetPulseWidthUs(uint8_t channel);
+    static uint32_t GetFrequency(PWMInput input);
+    static float GetDuty(PWMInput input);
+    static uint32_t GetPeriodUs(PWMInput input);
+    static uint32_t GetPulseWidthUs(PWMInput input);
 
-    static bool IsRunning(uint8_t channel);
-    static bool IsValid(uint8_t channel);
+    static bool IsValid(PWMInput input);
+    static bool IsRunning(PWMInput input);
 
-    // Forward HAL input-capture callbacks here.
-    static void HandleCapture(TIM_HandleTypeDef* htim);
+    static void CaptureCallback(TIM_HandleTypeDef* htim);
+    static void Update();
 
 private:
-    struct CaptureState
-    {
-        volatile uint32_t lastRising;
-        volatile uint32_t highTicks;
+    static constexpr uint8_t CHANNEL_COUNT = 8;
+    static constexpr uint32_t SIGNAL_TIMEOUT_MS = 2000U;
 
-        volatile uint32_t frequencyHz;
-        volatile uint32_t periodUs;
-        volatile uint32_t pulseWidthUs;
-        volatile float dutyPercent;
-
-        volatile bool haveRising;
-        volatile bool haveHigh;
-        volatile bool waitingForFalling;
-        volatile bool running;
-        volatile bool valid;
-    };
-
-    static CaptureState state[8];
-
-    static bool IsValidChannel(uint8_t channel);
+    static uint8_t ToIndex(PWMInput input);
+    static bool IsValidInput(PWMInput input);
 
     static uint32_t GetTimerClock(TIM_HandleTypeDef* timer);
-    static uint32_t GetCounterClock(TIM_HandleTypeDef* timer);
+    static uint32_t GetCounterClock(PWMInput input);
 
-    static uint32_t GetElapsedTicks(
-        TIM_HandleTypeDef* timer,
-        uint32_t start,
-        uint32_t end
-    );
+    static uint32_t CalculateDelta(
+        uint32_t current,
+        uint32_t previous,
+        uint32_t counterPeriod);
 
-    static uint32_t GetTimerChannel(uint32_t activeChannel);
+    static bool running[CHANNEL_COUNT];
+    static bool haveRising[CHANNEL_COUNT];
+    static bool waitingForFalling[CHANNEL_COUNT];
+    static bool valid[CHANNEL_COUNT];
+
+    static uint32_t lastRising[CHANNEL_COUNT];
+    static uint32_t periodTicks[CHANNEL_COUNT];
+    static uint32_t highTicks[CHANNEL_COUNT];
+    static uint32_t counterClockHz[CHANNEL_COUNT];
+    static uint32_t lastCaptureTick[CHANNEL_COUNT];
 };
 
 #endif
