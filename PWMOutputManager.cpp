@@ -1,498 +1,414 @@
+#include "PWMOutputManager.hpp"
 
-#include "PWMInputManager.hpp"
+constexpr uint8_t PWMOutputManager::OUTPUT_COUNT;
 
-PWMInputManager::CaptureState PWMInputManager::state[8] = {};
+bool PWMOutputManager::running[OUTPUT_COUNT] = {false};
+float PWMOutputManager::dutyPercent[OUTPUT_COUNT] = {0.0f};
 
 
-// ==================================================
-// CHANNEL VALIDATION
-// ==================================================
-
-bool PWMInputManager::IsValidChannel(uint8_t channel)
+// --------------------------------------------------
+// Convert enum to array index
+// --------------------------------------------------
+uint8_t PWMOutputManager::ToIndex(PWMOutput output)
 {
-    return (channel >= 1U && channel <= 8U);
+    return static_cast<uint8_t>(output);
 }
 
 
-// ==================================================
-// TIMER CLOCK
-// ==================================================
+// --------------------------------------------------
+// Validate output
+// --------------------------------------------------
+bool PWMOutputManager::IsValidOutput(PWMOutput output)
+{
+    return ToIndex(output) < OUTPUT_COUNT;
+}
 
-uint32_t PWMInputManager::GetTimerClock(
+
+// --------------------------------------------------
+// Initialize manager
+// Call after CubeMX timer initialization
+// --------------------------------------------------
+void PWMOutputManager::Init()
+{
+    for (uint8_t i = 0U; i < OUTPUT_COUNT; i++)
+    {
+        PWMOutput output = static_cast<PWMOutput>(i);
+        const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+        running[i] = false;
+
+        uint32_t arr =
+            __HAL_TIM_GET_AUTORELOAD(config.timer);
+
+        uint32_t compare =
+            __HAL_TIM_GET_COMPARE(config.timer, config.channel);
+
+        uint32_t periodCounts = arr + 1U;
+
+        if (periodCounts > 0U)
+        {
+            dutyPercent[i] =
+                ((float)compare * 100.0f) /
+                (float)periodCounts;
+
+            if (dutyPercent[i] > 100.0f)
+            {
+                dutyPercent[i] = 100.0f;
+            }
+        }
+        else
+        {
+            dutyPercent[i] = 0.0f;
+        }
+    }
+}
+
+
+// --------------------------------------------------
+// Get timer input clock using HAL functions
+// STM32G491RE timer clock mapping used by this project
+// --------------------------------------------------
+uint32_t PWMOutputManager::GetTimerClock(
     TIM_HandleTypeDef* timer)
 {
     if (timer == nullptr)
+    {
         return 0U;
+    }
 
-    RCC_ClkInitTypeDef clockConfig = {};
+    RCC_ClkInitTypeDef clockConfig = {0};
     uint32_t flashLatency = 0U;
 
     HAL_RCC_GetClockConfig(&clockConfig, &flashLatency);
 
-    uint32_t pclk;
-    uint32_t apbDivider;
+    // APB2 timers
+    if ((timer->Instance == TIM1)  ||
+        (timer->Instance == TIM8)  ||
+        (timer->Instance == TIM15))
+    {
+        uint32_t pclk2 = HAL_RCC_GetPCLK2Freq();
 
-    if (timer->Instance == TIM3)
-    {
-        // TIM3 uses APB1.
-        pclk = HAL_RCC_GetPCLK1Freq();
-        apbDivider = clockConfig.APB1CLKDivider;
-    }
-    else if (timer->Instance == TIM8 ||
-             timer->Instance == TIM15)
-    {
-        // TIM8 and TIM15 use APB2.
-        pclk = HAL_RCC_GetPCLK2Freq();
-        apbDivider = clockConfig.APB2CLKDivider;
-    }
-    else
-    {
-        return 0U;
+        if (clockConfig.APB2CLKDivider == RCC_HCLK_DIV1)
+        {
+            return pclk2;
+        }
+
+        return pclk2 * 2U;
     }
 
-    // STM32G491 timer clock:
-    // APB divider = 1: timer clock = PCLK
-    // APB divider > 1: timer clock = 2 * PCLK
-    if (apbDivider != RCC_HCLK_DIV1)
+    // APB1 timers
+    if ((timer->Instance == TIM2) ||
+        (timer->Instance == TIM3) ||
+        (timer->Instance == TIM4))
     {
-        pclk *= 2U;
+        uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+
+        if (clockConfig.APB1CLKDivider == RCC_HCLK_DIV1)
+        {
+            return pclk1;
+        }
+
+        return pclk1 * 2U;
     }
 
-    return pclk;
+    return 0U;
 }
 
 
-uint32_t PWMInputManager::GetCounterClock(
-    TIM_HandleTypeDef* timer)
+// --------------------------------------------------
+// Start one PWM output
+// --------------------------------------------------
+bool PWMOutputManager::Start(PWMOutput output)
 {
-    if (timer == nullptr)
-        return 0U;
+    if (!IsValidOutput(output))
+    {
+        return false;
+    }
+
+    uint8_t index = ToIndex(output);
+    const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+    if (HAL_TIM_PWM_Start(
+            config.timer,
+            config.channel) == HAL_OK)
+    {
+        running[index] = true;
+        return true;
+    }
+
+    return false;
+}
+
+
+// --------------------------------------------------
+// Stop one PWM output
+// --------------------------------------------------
+bool PWMOutputManager::Stop(PWMOutput output)
+{
+    if (!IsValidOutput(output))
+    {
+        return false;
+    }
+
+    uint8_t index = ToIndex(output);
+    const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+    if (HAL_TIM_PWM_Stop(
+            config.timer,
+            config.channel) == HAL_OK)
+    {
+        running[index] = false;
+        return true;
+    }
+
+    return false;
+}
+
+
+// --------------------------------------------------
+// Start all PWM outputs
+// --------------------------------------------------
+void PWMOutputManager::StartAll()
+{
+    for (uint8_t i = 0U; i < OUTPUT_COUNT; i++)
+    {
+        Start(static_cast<PWMOutput>(i));
+    }
+}
+
+
+// --------------------------------------------------
+// Stop all PWM outputs
+// --------------------------------------------------
+void PWMOutputManager::StopAll()
+{
+    for (uint8_t i = 0U; i < OUTPUT_COUNT; i++)
+    {
+        Stop(static_cast<PWMOutput>(i));
+    }
+}
+
+
+// --------------------------------------------------
+// Set duty cycle for one output
+// --------------------------------------------------
+bool PWMOutputManager::SetDuty(
+    PWMOutput output,
+    float duty)
+{
+    if (!IsValidOutput(output))
+    {
+        return false;
+    }
+
+    if ((duty < 0.0f) || (duty > 100.0f))
+    {
+        return false;
+    }
+
+    uint8_t index = ToIndex(output);
+
+    dutyPercent[index] = duty;
+
+    return ApplyDuty(index);
+}
+
+
+// --------------------------------------------------
+// Apply the stored duty cycle to the timer CCR register
+// --------------------------------------------------
+bool PWMOutputManager::ApplyDuty(uint8_t index)
+{
+    if (index >= OUTPUT_COUNT)
+    {
+        return false;
+    }
+
+    PWMOutput output = static_cast<PWMOutput>(index);
+    const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+    uint32_t arr =
+        __HAL_TIM_GET_AUTORELOAD(config.timer);
+
+    uint64_t periodCounts = (uint64_t)arr + 1ULL;
+
+    uint64_t compare =
+        (uint64_t)(
+            (periodCounts * dutyPercent[index] + 50.0f)
+            / 100.0f
+        );
+
+    // Allow ARR + 1 except when it exceeds the
+    // 16-bit compare-register range.
+    uint32_t maxCompare =
+        (arr < 0xFFFFU) ? (arr + 1U) : arr;
+
+    if (compare > maxCompare)
+    {
+        compare = maxCompare;
+    }
+
+    __HAL_TIM_SET_COMPARE(
+        config.timer,
+        config.channel,
+        (uint32_t)compare
+    );
+
+    return true;
+}
+
+
+// --------------------------------------------------
+// Set PWM frequency
+// Chooses PSC and ARR based on the timer input clock
+// --------------------------------------------------
+bool PWMOutputManager::SetFrequency(
+    PWMOutput output,
+    uint32_t frequencyHz)
+{
+    if (!IsValidOutput(output) || (frequencyHz == 0U))
+    {
+        return false;
+    }
+
+    const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+    TIM_HandleTypeDef* timer = config.timer;
 
     uint32_t timerClock = GetTimerClock(timer);
 
+    if (timerClock == 0U)
+    {
+        return false;
+    }
+
+    uint32_t prescaler = 0U;
+    uint64_t periodCounts = 0ULL;
+
+    // Use a 16-bit ARR range for all mapped timers.
+    // Choose the smallest prescaler that fits.
+    while (true)
+    {
+        uint64_t denominator =
+            ((uint64_t)prescaler + 1ULL) * frequencyHz;
+
+        periodCounts =
+            ((uint64_t)timerClock + denominator / 2ULL)
+            / denominator;
+
+        // Require at least two counter ticks per period.
+        if (periodCounts < 2ULL)
+        {
+            return false;
+        }
+
+        if (periodCounts <= 65536ULL)
+        {
+            break;
+        }
+
+        if (prescaler >= 65535U)
+        {
+            return false;
+        }
+
+        prescaler++;
+    }
+
+    uint32_t arr = (uint32_t)(periodCounts - 1ULL);
+
+    // Program the timer registers.
+    __HAL_TIM_SET_PRESCALER(timer, prescaler);
+    __HAL_TIM_SET_AUTORELOAD(timer, arr);
+
+    // Preserve the duty cycle for every mapped output
+    // that shares this timer.
+    for (uint8_t i = 0U; i < OUTPUT_COUNT; i++)
+    {
+        PWMOutput currentOutput =
+            static_cast<PWMOutput>(i);
+
+        const PWMOutputConfig& currentConfig =
+            GetPWMOutputConfig(currentOutput);
+
+        if (currentConfig.timer == timer)
+        {
+            ApplyDuty(i);
+        }
+    }
+
+    // Apply PSC, ARR and compare changes promptly.
+    __HAL_TIM_SET_COUNTER(timer, 0U);
+    __HAL_TIM_GENERATE_EVENT(timer, TIM_EVENTSOURCE_UPDATE);
+    __HAL_TIM_CLEAR_FLAG(timer, TIM_FLAG_UPDATE);
+
+    return true;
+}
+
+
+// --------------------------------------------------
+// Get actual PWM frequency from timer registers
+// Uses HAL prescaler and auto-reload register macros
+// --------------------------------------------------
+uint32_t PWMOutputManager::GetFrequency(PWMOutput output)
+{
+    if (!IsValidOutput(output))
+    {
+        return 0U;
+    }
+
+    const PWMOutputConfig& config = GetPWMOutputConfig(output);
+
+    uint32_t timerClock = GetTimerClock(config.timer);
+
+    if (timerClock == 0U)
+    {
+        return 0U;
+    }
+
+    // Read actual programmed register values.
     uint32_t prescaler =
-        __HAL_TIM_GET_PRESCALER(timer) + 1U;
+        __HAL_TIM_GET_PRESCALER(config.timer);
 
-    if (prescaler == 0U)
+    uint32_t arr =
+        __HAL_TIM_GET_AUTORELOAD(config.timer);
+
+    uint64_t divisor =
+        ((uint64_t)prescaler + 1ULL) *
+        ((uint64_t)arr + 1ULL);
+
+    if (divisor == 0ULL)
+    {
         return 0U;
-
-    return timerClock / prescaler;
-}
-
-
-// ==================================================
-// CAPTURE HELPERS
-// ==================================================
-
-uint32_t PWMInputManager::GetElapsedTicks(
-    TIM_HandleTypeDef* timer,
-    uint32_t start,
-    uint32_t end)
-{
-    uint64_t modulus =
-        (uint64_t)__HAL_TIM_GET_AUTORELOAD(timer) + 1ULL;
-
-    return (uint32_t)(
-        ((uint64_t)end + modulus - start) % modulus
-    );
-}
-
-
-uint32_t PWMInputManager::GetTimerChannel(
-    uint32_t activeChannel)
-{
-    switch (activeChannel)
-    {
-        case HAL_TIM_ACTIVE_CHANNEL_1:
-            return TIM_CHANNEL_1;
-
-        case HAL_TIM_ACTIVE_CHANNEL_2:
-            return TIM_CHANNEL_2;
-
-        case HAL_TIM_ACTIVE_CHANNEL_3:
-            return TIM_CHANNEL_3;
-
-        case HAL_TIM_ACTIVE_CHANNEL_4:
-            return TIM_CHANNEL_4;
-
-        default:
-            return 0U;
-    }
-}
-
-
-// ==================================================
-// INITIALIZATION
-// ==================================================
-
-bool PWMInputManager::Init()
-{
-    for (uint8_t i = 0U; i < 8U; i++)
-    {
-        if (pwmInputMap[i].timer == nullptr)
-            return false;
-
-        state[i].lastRising = 0U;
-        state[i].highTicks = 0U;
-
-        state[i].frequencyHz = 0U;
-        state[i].periodUs = 0U;
-        state[i].pulseWidthUs = 0U;
-        state[i].dutyPercent = 0.0f;
-
-        state[i].haveRising = false;
-        state[i].haveHigh = false;
-        state[i].waitingForFalling = false;
-        state[i].running = false;
-        state[i].valid = false;
     }
 
-    return true;
+    return (uint32_t)((uint64_t)timerClock / divisor);
 }
 
 
-// ==================================================
-// START ONE INPUT
-// ==================================================
-
-bool PWMInputManager::Start(uint8_t channel)
+// --------------------------------------------------
+// Get last duty value requested through this manager
+// --------------------------------------------------
+float PWMOutputManager::GetDuty(PWMOutput output)
 {
-    if (!IsValidChannel(channel))
-        return false;
-
-    uint8_t index = channel - 1U;
-
-    const PWMInputConfig& config = pwmInputMap[index];
-
-    if (config.timer == nullptr)
-        return false;
-
-    if (state[index].running)
-        return true;
-
-    if (GetCounterClock(config.timer) == 0U)
-        return false;
-
-    // Reset measurement state.
-    state[index].lastRising = 0U;
-    state[index].highTicks = 0U;
-
-    state[index].frequencyHz = 0U;
-    state[index].periodUs = 0U;
-    state[index].pulseWidthUs = 0U;
-    state[index].dutyPercent = 0.0f;
-
-    state[index].haveRising = false;
-    state[index].haveHigh = false;
-    state[index].waitingForFalling = false;
-    state[index].valid = false;
-
-    // First capture a rising edge.
-    __HAL_TIM_SET_CAPTUREPOLARITY(
-        config.timer,
-        config.channel,
-        TIM_INPUTCHANNELPOLARITY_RISING
-    );
-
-    if (HAL_TIM_IC_Start_IT(
-            config.timer,
-            config.channel) != HAL_OK)
+    if (!IsValidOutput(output))
     {
-        return false;
-    }
-
-    state[index].running = true;
-
-    return true;
-}
-
-
-// ==================================================
-// STOP ONE INPUT
-// ==================================================
-
-bool PWMInputManager::Stop(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
-        return false;
-
-    uint8_t index = channel - 1U;
-
-    const PWMInputConfig& config = pwmInputMap[index];
-
-    if (!state[index].running)
-        return true;
-
-    if (HAL_TIM_IC_Stop_IT(
-            config.timer,
-            config.channel) != HAL_OK)
-    {
-        return false;
-    }
-
-    __HAL_TIM_SET_CAPTUREPOLARITY(
-        config.timer,
-        config.channel,
-        TIM_INPUTCHANNELPOLARITY_RISING
-    );
-
-    state[index].running = false;
-    state[index].valid = false;
-
-    return true;
-}
-
-
-// ==================================================
-// START ALL INPUTS
-// ==================================================
-
-bool PWMInputManager::StartAll()
-{
-    for (uint8_t channel = 1U; channel <= 8U; channel++)
-    {
-        if (!Start(channel))
-            return false;
-    }
-
-    return true;
-}
-
-
-// ==================================================
-// STOP ALL INPUTS
-// ==================================================
-
-bool PWMInputManager::StopAll()
-{
-    bool success = true;
-
-    for (uint8_t channel = 1U; channel <= 8U; channel++)
-    {
-        if (!Stop(channel))
-            success = false;
-    }
-
-    return success;
-}
-
-
-// ==================================================
-// INPUT CAPTURE HANDLER
-// ==================================================
-
-void PWMInputManager::HandleCapture(
-    TIM_HandleTypeDef* htim)
-{
-    if (htim == nullptr)
-        return;
-
-    uint32_t activeChannel =
-        GetTimerChannel(htim->Channel);
-
-    if (activeChannel == 0U)
-        return;
-
-    for (uint8_t i = 0U; i < 8U; i++)
-    {
-        const PWMInputConfig& config = pwmInputMap[i];
-
-        if (config.timer != htim ||
-            config.channel != activeChannel ||
-            !state[i].running)
-        {
-            continue;
-        }
-
-        uint32_t capture =
-            HAL_TIM_ReadCapturedValue(htim, activeChannel);
-
-        uint32_t counterClock = GetCounterClock(htim);
-
-        if (counterClock == 0U)
-            return;
-
-        if (!state[i].waitingForFalling)
-        {
-            // --------------------------------------
-            // RISING EDGE
-            // --------------------------------------
-
-            if (state[i].haveRising)
-            {
-                uint32_t period = GetElapsedTicks(
-                    htim,
-                    state[i].lastRising,
-                    capture
-                );
-
-                if (period > 0U)
-                {
-                    uint64_t periodUs =
-                        ((uint64_t)period * 1000000ULL)
-                        / counterClock;
-
-                    state[i].periodUs =
-                        periodUs > UINT32_MAX
-                        ? UINT32_MAX
-                        : (uint32_t)periodUs;
-
-                    state[i].frequencyHz =
-                        (uint32_t)(
-                            ((uint64_t)counterClock + period / 2U)
-                            / period
-                        );
-
-                    if (state[i].haveHigh &&
-                        state[i].highTicks <= period)
-                    {
-                        state[i].dutyPercent =
-                            100.0f *
-                            (float)state[i].highTicks /
-                            (float)period;
-
-                        uint64_t pulseUs =
-                            ((uint64_t)state[i].highTicks
-                             * 1000000ULL)
-                            / counterClock;
-
-                        state[i].pulseWidthUs =
-                            pulseUs > UINT32_MAX
-                            ? UINT32_MAX
-                            : (uint32_t)pulseUs;
-
-                        state[i].valid = true;
-                    }
-                }
-            }
-
-            state[i].lastRising = capture;
-            state[i].haveRising = true;
-            state[i].waitingForFalling = true;
-
-            // Switch this channel to falling-edge capture.
-            __HAL_TIM_SET_CAPTUREPOLARITY(
-                htim,
-                activeChannel,
-                TIM_INPUTCHANNELPOLARITY_FALLING
-            );
-        }
-        else
-        {
-            // --------------------------------------
-            // FALLING EDGE
-            // --------------------------------------
-
-            if (state[i].haveRising)
-            {
-                state[i].highTicks = GetElapsedTicks(
-                    htim,
-                    state[i].lastRising,
-                    capture
-                );
-
-                state[i].haveHigh = true;
-            }
-
-            state[i].waitingForFalling = false;
-
-            // Switch this channel back to rising-edge capture.
-            __HAL_TIM_SET_CAPTUREPOLARITY(
-                htim,
-                activeChannel,
-                TIM_INPUTCHANNELPOLARITY_RISING
-            );
-        }
-
-        return;
-    }
-}
-
-
-// ==================================================
-// READ FREQUENCY
-// ==================================================
-
-uint32_t PWMInputManager::GetFrequency(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
-        return 0U;
-
-    return state[channel - 1U].frequencyHz;
-}
-
-
-// ==================================================
-// READ DUTY CYCLE
-// ==================================================
-
-float PWMInputManager::GetDuty(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
         return 0.0f;
+    }
 
-    return state[channel - 1U].dutyPercent;
+    return dutyPercent[ToIndex(output)];
 }
 
 
-// ==================================================
-// READ PERIOD
-// ==================================================
-
-uint32_t PWMInputManager::GetPeriodUs(uint8_t channel)
+// --------------------------------------------------
+// Check manager's running state
+// --------------------------------------------------
+bool PWMOutputManager::IsRunning(PWMOutput output)
 {
-    if (!IsValidChannel(channel))
-        return 0U;
-
-    return state[channel - 1U].periodUs;
-}
-
-
-// ==================================================
-// READ HIGH-PULSE WIDTH
-// ==================================================
-
-uint32_t PWMInputManager::GetPulseWidthUs(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
-        return 0U;
-
-    return state[channel - 1U].pulseWidthUs;
-}
-
-
-// ==================================================
-// STATUS
-// ==================================================
-
-bool PWMInputManager::IsRunning(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
+    if (!IsValidOutput(output))
+    {
         return false;
+    }
 
-    return state[channel - 1U].running;
-}
-
-
-bool PWMInputManager::IsValid(uint8_t channel)
-{
-    if (!IsValidChannel(channel))
-        return false;
-
-    return state[channel - 1U].valid;
-}
-
-
-// ==================================================
-// HAL INPUT CAPTURE CALLBACK
-// ==================================================
-
-// If this callback already exists in your project,
-// add the HandleCapture() call to the existing callback
-// instead of defining this function a second time.
-
-extern "C" void HAL_TIM_IC_CaptureCallback(
-    TIM_HandleTypeDef* htim)
-{
-    PWMInputManager::HandleCapture(htim);
+    return running[ToIndex(output)];
 }
