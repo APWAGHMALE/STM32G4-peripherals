@@ -6,6 +6,8 @@ bool PWMOutputManager::running[OUTPUT_COUNT] = {false};
 float PWMOutputManager::dutyPercent[OUTPUT_COUNT] = {0.0f};
 
 
+//uint32_t prescaler = config.timer->Instance->PSC; 
+
 // --------------------------------------------------
 // Convert enum to array index
 // --------------------------------------------------
